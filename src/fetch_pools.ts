@@ -4,8 +4,8 @@ import * as path from 'path';
 import { SingleBar, Presets } from 'cli-progress';
 
 // ================= 配置区域 =================
-// const RPC_URL = 'http://127.0.0.1:8545';
-const RPC_URL = 'https://mainnet.base.org'
+const RPC_URL = 'http://127.0.0.1:8545';
+// const RPC_URL = 'https://mainnet.base.org'
 const BATCH_SIZE = 500;
 
 // 核心白名单代币 (用于判断池子质量)
