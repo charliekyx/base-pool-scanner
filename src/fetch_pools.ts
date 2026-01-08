@@ -5,20 +5,33 @@ import { SingleBar, Presets } from 'cli-progress';
 
 // ================= 配置区域 =================
 const RPC_URL = 'http://127.0.0.1:8545';
-const BATCH_SIZE = 500;
 
-// 核心白名单代币 (用于判断池子质量)
-const WHITELIST_TOKENS = new Set([
-    '0x4200000000000000000000000000000000000006', // WETH
-    '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
-    '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', // USDbC
-    '0x940181a94A35A4569E4529A3CDfB74e38FD98631', // AERO
-    '0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22', // cbETH
-    '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // DAI
-    '0x0000206329b97DB379d5E1Bf586BbDB969C63274', // bsUSD (BaseSwap)
-]);
+// ⚠️ 关键修改：降低 Batch Size 防止节点过载
+const BATCH_SIZE = 50; 
+// ⚠️ 关键修改：批次间隔休息时间 (毫秒)
+const BATCH_DELAY_MS = 100;
 
-// 协议列表
+// === 阈值定义 (Hard Filters) ===
+// 0.1 ETH (18 decimals)
+const MIN_ETH_LIQUIDITY = 100000000000000000n; 
+// 500 USDC (6 decimals) - 提高门槛，过滤垃圾池
+const MIN_USDC_LIQUIDITY = 500000000n; 
+
+// 核心白名单代币 & 精度映射
+const TOKEN_CONFIG: { [key: string]: { decimals: number, type: 'ETH' | 'USD' | 'OTHER' } } = {
+    '0x4200000000000000000000000000000000000006': { decimals: 18, type: 'ETH' }, // WETH
+    '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913': { decimals: 6, type: 'USD' },  // USDC
+    '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA': { decimals: 6, type: 'USD' },  // USDbC
+    '0x940181a94A35A4569E4529A3CDfB74e38FD98631': { decimals: 18, type: 'OTHER' }, // AERO
+    '0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22': { decimals: 18, type: 'ETH' }, // cbETH
+    '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb': { decimals: 18, type: 'USD' },  // DAI
+    '0x0000206329b97DB379d5E1Bf586BbDB969C63274': { decimals: 18, type: 'OTHER' }, // bsUSD
+};
+
+// 辅助：判断是否在白名单
+const isWhitelisted = (addr: string) => Object.keys(TOKEN_CONFIG).includes(addr);
+
+// 协议列表 (保持不变)
 const PROTOCOLS = [
     // 1. Aerodrome Legacy (V2)
     {
@@ -66,39 +79,12 @@ const PROTOCOLS = [
 
 const MULTICALL_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 
-// ================= ABIs =================
-const MULTICALL_ABI = [
-    'function aggregate(tuple(address target, bytes callData)[] calls) public view returns (uint256 blockNumber, bytes[] returnData)'
-];
-
-const V3_POOL_ABI = [
-    'function token0() view returns (address)',
-    'function token1() view returns (address)',
-    'function fee() view returns (uint24)',
-    'function tickSpacing() view returns (int24)',
-    'function liquidity() view returns (uint128)'
-];
-
-const V2_PAIR_ABI = [
-    'function token0() view returns (address)',
-    'function token1() view returns (address)',
-    'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)'
-];
-
-const AERO_V2_PAIR_ABI = [
-    'function token0() view returns (address)',
-    'function token1() view returns (address)',
-    'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
-    'function stable() view returns (bool)'
-];
-
-const FACTORY_ABI = [
-    'function allPoolsLength() view returns (uint256)',
-    'function allPools(uint256) view returns (address)',
-    'function allPairsLength() view returns (uint256)',
-    'function allPairs(uint256) view returns (address)'
-];
-
+// ================= ABIs (保持不变) =================
+const MULTICALL_ABI = ['function aggregate(tuple(address target, bytes callData)[] calls) public view returns (uint256 blockNumber, bytes[] returnData)'];
+const V3_POOL_ABI = ['function token0() view returns (address)', 'function token1() view returns (address)', 'function fee() view returns (uint24)', 'function tickSpacing() view returns (int24)', 'function liquidity() view returns (uint128)'];
+const V2_PAIR_ABI = ['function token0() view returns (address)', 'function token1() view returns (address)', 'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)'];
+const AERO_V2_PAIR_ABI = ['function token0() view returns (address)', 'function token1() view returns (address)', 'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)', 'function stable() view returns (bool)'];
+const FACTORY_ABI = ['function allPoolsLength() view returns (uint256)', 'function allPools(uint256) view returns (address)', 'function allPairsLength() view returns (uint256)', 'function allPairs(uint256) view returns (address)'];
 const V3_FACTORY_TOPIC = ethers.id("PoolCreated(address,address,uint24,int24,address)");
 
 interface PoolOutput {
@@ -114,26 +100,24 @@ interface PoolOutput {
     protocol: String
 }
 
-// 辅助函数：带重试机制的 getLogs
+// 辅助函数
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
 async function getLogsWithRetry(provider: ethers.JsonRpcProvider, filter: any, retries = 5): Promise<any[]> {
     for (let i = 0; i < retries; i++) {
         try {
             return await provider.getLogs(filter);
         } catch (error: any) {
-            // 如果是超时(-32002)或者其他网络错误，则重试
-            if (i === retries - 1) throw error; // 最后一次尝试失败，抛出异常
-            
-            const delay = 2000 * (i + 1); // 递增延迟: 2s, 4s, 6s...
-            // 可以在这里打印日志，但为了界面整洁暂时注释掉
-            // console.log(`\n⚠️  Log scan timeout, retrying in ${delay}ms...`);
-            await new Promise(r => setTimeout(r, delay));
+            if (i === retries - 1) throw error;
+            const delay = 2000 * (i + 1);
+            await sleep(delay);
         }
     }
     return [];
 }
 
 async function main() {
-    console.log("🚀 Starting V2/V3/CL Hybrid Pool Scanner (Stable Mode)...");
+    console.log("🚀 Starting V2/V3/CL Hybrid Pool Scanner (Clean Mode)...");
     const provider = new ethers.JsonRpcProvider(RPC_URL);
     
     try { await provider.getNetwork(); } catch (e) {
@@ -147,14 +131,11 @@ async function main() {
         console.log(`\n📡 Scanning Protocol: ${proto.name} (${proto.type})...`);
         let poolAddresses: string[] = [];
 
+        // 1. 获取池子地址 (Log Scan 或 Factory 遍历)
         if (proto.method === 'logs') {
-            // === V3 Log Scanning (Optimized) ===
-            console.log(`   Scanning V3 Logs (Batch Size: 5000, Auto-Retry Enabled)...`);
+            console.log(`   Scanning V3 Logs...`);
             const currentBlock = await provider.getBlockNumber();
-            
-            // 核心修改：大幅减小 Step，防止 Timeout
             const step = 5000; 
-            
             const bar = new SingleBar({}, Presets.shades_classic);
             bar.start(currentBlock - proto.startBlock!, 0);
 
@@ -162,16 +143,13 @@ async function main() {
 
             for (let from = proto.startBlock!; from < currentBlock; from += step) {
                 const to = Math.min(from + step, currentBlock);
-                
                 try {
-                    // 使用重试机制获取日志
                     const logs = await getLogsWithRetry(provider, {
                         address: proto.factory,
                         topics: [V3_FACTORY_TOPIC],
                         fromBlock: from,
                         toBlock: to
                     });
-
                     for (const log of logs) {
                         try {
                             const parsed = iface.parseLog(log);
@@ -179,15 +157,12 @@ async function main() {
                         } catch(e) {}
                     }
                 } catch (err) {
-                    console.error(`\n❌ Critical Error scanning blocks ${from}-${to}:`, err);
-                    // 继续还是退出？为了数据完整性，这里选择继续，但打印错误
+                    console.error(`\n❌ Error scanning blocks ${from}-${to}`);
                 }
-                
                 bar.update(from - proto.startBlock!);
             }
             bar.stop();
         } else {
-            // === Factory Enumeration (Aerodrome/BaseSwap) ===
             const factory = new Contract(proto.factory, FACTORY_ABI, provider);
             // @ts-ignore
             const count = Number(await factory[proto.countMethod]());
@@ -208,20 +183,25 @@ async function main() {
                     poolAddresses.push(factoryIface.decodeFunctionResult(proto.method, r)[0]);
                 });
                 bar.update(end);
+                await sleep(BATCH_DELAY_MS); // 休息一下
             }
             bar.stop();
         }
 
-        // === 批量获取详情并过滤 ===
-        console.log(`   Fetching details for ${poolAddresses.length} pools...`);
+        // 2. 批量获取详情并执行 "Hard Filter"
+        console.log(`   Fetching & Filtering ${poolAddresses.length} pools...`);
         const v3Iface = new ethers.Interface(V3_POOL_ABI);
         const v2Iface = new ethers.Interface(V2_PAIR_ABI);
         const aeroV2Iface = new ethers.Interface(AERO_V2_PAIR_ABI);
+
+        let droppedCount = 0;
+        let keptCount = 0;
 
         for (let i = 0; i < poolAddresses.length; i += BATCH_SIZE) {
             const batchAddrs = poolAddresses.slice(i, i + BATCH_SIZE);
             const calls = [];
 
+            // Encode Calls
             for (const addr of batchAddrs) {
                 if (proto.abiType === 'v3') {
                     calls.push({ target: addr, callData: v3Iface.encodeFunctionData('token0', []) });
@@ -248,9 +228,10 @@ async function main() {
                 for (let k = 0; k < batchAddrs.length; k++) {
                     const poolAddr = batchAddrs[k];
                     try {
-                        let t0, t1, valid = false;
+                        let t0: string, t1: string, valid = false;
                         let poolData: any = {};
 
+                        // Decode & Validate Logic
                         if (proto.abiType === 'v3') {
                             t0 = v3Iface.decodeFunctionResult('token0', results[resultIdx++])[0];
                             t1 = v3Iface.decodeFunctionResult('token1', results[resultIdx++])[0];
@@ -258,37 +239,59 @@ async function main() {
                             const fee = Number(v3Iface.decodeFunctionResult('fee', results[resultIdx++])[0]);
                             const ts = Number(v3Iface.decodeFunctionResult('tickSpacing', results[resultIdx++])[0]);
 
-                            if (liq > 0n) {
+                            // V3 简单过滤: 有流动性且不为0 (V3 余额检查太贵，先相信流动性不为0)
+                            // 修正：可以提高一点门槛防止微尘
+                            if (liq > 100000n) {
                                 valid = true;
                                 poolData = { fee, tick_spacing: ts, pool_fee: fee };
                             }
 
-                        } else if (proto.abiType === 'aero_v2') {
-                            t0 = aeroV2Iface.decodeFunctionResult('token0', results[resultIdx++])[0];
-                            t1 = aeroV2Iface.decodeFunctionResult('token1', results[resultIdx++])[0];
-                            const reserves = aeroV2Iface.decodeFunctionResult('getReserves', results[resultIdx++]);
-                            const isStable = aeroV2Iface.decodeFunctionResult('stable', results[resultIdx++])[0];
+                        } else { // V2 & Aero V2
+                            let reserves;
+                            let isStable = false;
 
-                            if (!isStable && BigInt(reserves[0]) > 1000n && BigInt(reserves[1]) > 1000n) {
-                                valid = true;
+                            if (proto.abiType === 'aero_v2') {
+                                t0 = aeroV2Iface.decodeFunctionResult('token0', results[resultIdx++])[0];
+                                t1 = aeroV2Iface.decodeFunctionResult('token1', results[resultIdx++])[0];
+                                reserves = aeroV2Iface.decodeFunctionResult('getReserves', results[resultIdx++]);
+                                isStable = aeroV2Iface.decodeFunctionResult('stable', results[resultIdx++])[0];
+                            } else {
+                                t0 = v2Iface.decodeFunctionResult('token0', results[resultIdx++])[0];
+                                t1 = v2Iface.decodeFunctionResult('token1', results[resultIdx++])[0];
+                                reserves = v2Iface.decodeFunctionResult('getReserves', results[resultIdx++]);
                             }
 
-                        } else { 
-                            t0 = v2Iface.decodeFunctionResult('token0', results[resultIdx++])[0];
-                            t1 = v2Iface.decodeFunctionResult('token1', results[resultIdx++])[0];
-                            const reserves = v2Iface.decodeFunctionResult('getReserves', results[resultIdx++]);
+                            // === 核心 Hard Filter 逻辑 ===
+                            if (!isStable) {
+                                const r0 = BigInt(reserves[0]);
+                                const r1 = BigInt(reserves[1]);
 
-                            if (BigInt(reserves[0]) > 1000n && BigInt(reserves[1]) > 1000n) {
-                                valid = true;
+                                // 只有当“锚定币”的余额达标时，才算 Valid
+                                if (isWhitelisted(t0)) {
+                                    const config = TOKEN_CONFIG[t0];
+                                    if (config.type === 'ETH' && r0 >= MIN_ETH_LIQUIDITY) valid = true;
+                                    if (config.type === 'USD' && r0 >= MIN_USDC_LIQUIDITY) valid = true;
+                                    // 其他白名单代币，只要有一定量就行
+                                    if (config.type === 'OTHER' && r0 > 1000000n) valid = true; 
+                                }
+                                
+                                // 如果 t0 没过，再给 t1 一次机会 (只要一边达标即可)
+                                if (!valid && isWhitelisted(t1)) {
+                                    const config = TOKEN_CONFIG[t1];
+                                    if (config.type === 'ETH' && r1 >= MIN_ETH_LIQUIDITY) valid = true;
+                                    if (config.type === 'USD' && r1 >= MIN_USDC_LIQUIDITY) valid = true;
+                                    if (config.type === 'OTHER' && r1 > 1000000n) valid = true; 
+                                }
                             }
                         }
 
-                        if (valid && (WHITELIST_TOKENS.has(t0) || WHITELIST_TOKENS.has(t1))) {
-                            const name = `${proto.name}_${t0.slice(0,6)}_${poolAddr.slice(38)}`;
+                        // 最后一步：确保至少有一个白名单代币 (防止 Trash-Trash 配对)
+                        if (valid && (isWhitelisted(t0!) || isWhitelisted(t1!))) {
+                            const name = `${proto.name}_${t0!.slice(0,6)}_${poolAddr.slice(38)}`;
                             let output: PoolOutput = {
                                 name,
-                                token_a: t0,
-                                token_b: t1,
+                                token_a: t0!,
+                                token_b: t1!,
                                 router: proto.router!,
                                 protocol: proto.type,
                                 ...poolData
@@ -303,22 +306,33 @@ async function main() {
                             }
 
                             allPools.push(output);
+                            keptCount++;
+                        } else {
+                            droppedCount++;
                         }
 
-                    } catch (e) {}
+                    } catch (e) {
+                        // 解码失败通常意味着池子有问题，直接丢弃
+                        droppedCount++;
+                    }
                 }
 
             } catch (err) {
                 console.error(`Batch failed: ${err}`);
             }
-            process.stdout.write(`\r   Processed ${Math.min(i + BATCH_SIZE, poolAddresses.length)} pools...`);
+            
+            // 实时打印进度
+            process.stdout.write(`\r   Checked ${Math.min(i + BATCH_SIZE, poolAddresses.length)} pools | ✅ Kept: ${keptCount} | 🗑️ Dropped: ${droppedCount}`);
+            
+            // ⚠️ 休息！保护节点
+            await sleep(BATCH_DELAY_MS);
         }
-        console.log(`\n   ✅ Added valid pools.`);
+        console.log(`\n   ✅ Protocol ${proto.name} finished.`);
     }
 
     const outputPath = path.join(__dirname, '../pools.json');
     fs.writeFileSync(outputPath, JSON.stringify(allPools, null, 4));
-    console.log(`\n🎉 Done! Saved ${allPools.length} pools to pools.json`);
+    console.log(`\n🎉 Done! Saved ${allPools.length} HIGH QUALITY pools to pools.json`);
 }
 
 main().catch(console.error);
