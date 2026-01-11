@@ -6,33 +6,31 @@ import * as path from 'path';
 const RPC_URL = 'http://127.0.0.1:8545';
 
 const BATCH_SIZE = 100; 
-const BATCH_DELAY_MS = 20; 
+const BATCH_DELAY_MS = 10; 
 
-// === ⚖️ 阈值定义 (修正版) ===
-// 0.2 ETH (保留中型池)
-const MIN_ETH_LIQUIDITY = 200000000000000000n; 
-// 500 USDC
-const MIN_USDC_LIQUIDITY = 500000000n; 
-// 其他币种
-const MIN_OTHER_LIQUIDITY = 1000000000000000000n; 
+// === ⚖️ V2 阈值定义 ===
+const MIN_ETH_LIQUIDITY = 500000000000000000n; // 0.5 ETH (~$1500)
+const MIN_USDC_LIQUIDITY = 1500000000n;        // 1500 USDC
+const MIN_OTHER_LIQUIDITY = 5000000000000000000000n; 
 
-// 🔥 [关键修正] V3 流动性阈值
-// V3 Liquidity = sqrt(X * Y). 
-// 10^12 约为 $50 - $100 TVL 的等效流动性。
-// 低于这个值的 V3 池子基本无法进行任何有效套利，且 Gas 费占比过高。
-const MIN_V3_LIQUIDITY = 1000000000000n; // 1e12
+// === ⚖️ V3 阈值定义 (数学修正版) ===
+// 1 ETH ($3000) + 3000 USDC 的 L 约为 5.4e13
+// 我们设定两个档位：
+// LOW: ~$500 TVL (用于两个都是白名单币的池子) -> 1e13
+// HIGH: ~$5000 TVL (用于带土狗的池子，必须深度够厚才算安全) -> 1e14
+const MIN_V3_LIQ_LOW = 10000000000000n;   // 1e13 (~$500)
+const MIN_V3_LIQ_HIGH = 100000000000000n; // 1e14 (~$5000)
 
-// 核心白名单 (Tier 1 + Tier 2)
+// 白名单配置
 const TOKEN_CONFIG: { [key: string]: { decimals: number, type: 'ETH' | 'USD' | 'OTHER' } } = {
-    // --- Tier 1: Core ---
+    // --- Tier 1: 绝对核心 ---
     '0x4200000000000000000000000000000000000006': { decimals: 18, type: 'ETH' }, // WETH
     '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': { decimals: 6, type: 'USD' },  // USDC
     '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca': { decimals: 6, type: 'USD' },  // USDbC
     '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': { decimals: 18, type: 'USD' }, // DAI
     '0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22': { decimals: 18, type: 'ETH' }, // cbETH
-    '0x2416092f143378750bb29b79ed961ab195cceea5': { decimals: 18, type: 'ETH' }, // ezETH
 
-    // --- Tier 2: Hot Assets ---
+    // --- Tier 2: 热门资产 (Meme & DeFi) ---
     '0x940181a94a35a4569e4529a3cdfb74e38fd98631': { decimals: 18, type: 'OTHER' }, // AERO
     '0x0000206329b97db379d5e1bf586bbdb969c63274': { decimals: 18, type: 'OTHER' }, // bsUSD
     '0x399232699620ddca88632a988b8eb78c59f8ed68': { decimals: 18, type: 'OTHER' }, // VIRTUAL
@@ -41,7 +39,6 @@ const TOKEN_CONFIG: { [key: string]: { decimals: number, type: 'ETH' | 'USD' | '
     '0xac1bd2486aaf3b5c0fc3fd868558b082a531b2b4': { decimals: 18, type: 'OTHER' }, // TOSHI
     '0x2da56acb9ea78330f947bd57c54119debda7af71': { decimals: 18, type: 'OTHER' }, // MOG
     '0x9d90308d16b94c38048c78680663776c5acdf949': { decimals: 18, type: 'OTHER' }, // KEYCAT
-    '0x0d97f261b1e88845184f678e2d1e7a98d9fd38de': { decimals: 18, type: 'OTHER' }, // TYBG
 };
 
 const isWhitelisted = (addr: string) => Object.keys(TOKEN_CONFIG).includes(addr.toLowerCase());
@@ -108,7 +105,7 @@ async function getLogsWithRetry(provider: ethers.JsonRpcProvider, filter: any, r
 }
 
 async function main() {
-    console.log("🚀 Starting COMPATIBLE Pool Scanner (Auto-Adjusted)...");
+    console.log("🚀 Starting COMPATIBLE Pool Scanner (Final Strict Mode)...");
     const provider = new ethers.JsonRpcProvider(RPC_URL);
     const multicall = new Contract(MULTICALL_ADDRESS, MULTICALL_ABI, provider);
     const allPools: any[] = [];
@@ -117,14 +114,12 @@ async function main() {
         console.log(`\n📡 Scanning ${proto.name}...`);
         let poolAddresses: string[] = [];
 
-        // --- 1. 获取所有池子地址 ---
+        // --- 1. 获取地址 ---
         if (proto.method === 'logs') {
             console.log(`   Scanning Logs...`);
             const currentBlock = await provider.getBlockNumber();
             const step = 20000; 
             const iface = new ethers.Interface(["event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)"]);
-            
-            // 使用 Set 去重
             const uniquePools = new Set<string>();
 
             for (let from = proto.startBlock!; from < currentBlock; from += step) {
@@ -154,7 +149,7 @@ async function main() {
             console.log("");
         }
 
-        // --- 2. 批量过滤逻辑 ---
+        // --- 2. 严格过滤逻辑 ---
         console.log(`   Filtering ${poolAddresses.length} pools...`);
         const v3Iface = new ethers.Interface(V3_POOL_ABI);
         const v2Iface = new ethers.Interface(V2_PAIR_ABI);
@@ -201,8 +196,17 @@ async function main() {
                             const ts = Number(v3Iface.decodeFunctionResult('tickSpacing', results[idx++])[0]);
                             extraData = { fee, tick_spacing: ts, pool_fee: fee };
 
-                            // 🔥 V3 修改：使用新的 MIN_V3_LIQUIDITY (1e12)
-                            if (liq > MIN_V3_LIQUIDITY && (isWhitelisted(t0) || isWhitelisted(t1))) {
+                            // 🔥 V3 分级过滤策略 (Tiered Filtering)
+                            const isT0White = isWhitelisted(t0);
+                            const isT1White = isWhitelisted(t1);
+
+                            // 情况 1: 两个都是白名单 (Core Pair) -> 允许较低流动性 (~$500)
+                            if (isT0White && isT1White) {
+                                if (liq > MIN_V3_LIQ_LOW) valid = true;
+                            }
+                            // 情况 2: 只有一个是白名单 (Core-Meme) -> 必须有高流动性 (~$5000)
+                            // 这能有效过滤掉绝大多数只有 $10-$100 的垃圾空壳池
+                            else if ((isT0White || isT1White) && liq > MIN_V3_LIQ_HIGH) {
                                 valid = true;
                             }
 
@@ -225,6 +229,7 @@ async function main() {
                             const r0 = BigInt(reserves[0]);
                             const r1 = BigInt(reserves[1]);
 
+                            // V2 策略 (保持不变)
                             if (isWhitelisted(t0)) {
                                 const type = getTokenType(t0);
                                 if (type === 'ETH' && r0 >= MIN_ETH_LIQUIDITY) valid = true;
